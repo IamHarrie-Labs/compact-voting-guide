@@ -125,7 +125,7 @@ export circuit commitVote(
 
 export circuit revealVote(vote: Uint<8>): [] {
     assert(phase == 1, "Not in reveal phase");
-    assert(vote < 3, "Invalid vote: must be 0 (NO), 1 (YES), or 2 (ABSTAIN)");
+    assert(disclose(vote) < 3, "Invalid vote: must be 0 (NO), 1 (YES), or 2 (ABSTAIN)");
 
     // Private witnesses — never appear on-chain
     const secret  = getVoterSecret();
@@ -153,10 +153,12 @@ export circuit revealVote(vote: Uint<8>): [] {
     assert(!spentNullifiers.member(disclose(nullifierHash)), "Vote already revealed");
     spentNullifiers.insert(disclose(nullifierHash), disclose(true));
 
-    // Tally — vote is now public, branching on it is safe
-    if (vote == 0) {
+    // Tally — disclose(vote) required: branching on an exported parameter and
+    // performing different ledger operations per branch leaks the branch taken.
+    // Compact requires explicit disclose() to acknowledge this is intentional.
+    if (disclose(vote) == 0) {
         noVotes.increment(1);
-    } else if (vote == 1) {
+    } else if (disclose(vote) == 1) {
         yesVotes.increment(1);
     } else {
         abstainVotes.increment(1);
