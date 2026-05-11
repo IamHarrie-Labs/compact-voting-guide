@@ -48,14 +48,16 @@ witness getVoterPath(): MerkleTreePath<16, Bytes<32>>;
 
 // ─── Constructor ──────────────────────────────────────────────────────────
 
+// NOTE: Compact's range-typed arithmetic means adding two Uint<64> values produces
+// a wider type that can't be assigned back to Uint<64>. Pass absolute block heights
+// rather than computing (startBlock + duration) inside the contract.
 constructor(
-    startBlock: Uint<64>,
-    commitDuration: Uint<64>,
-    revealDuration: Uint<64>
+    commitDeadlineBlock: Uint<64>,
+    revealDeadlineBlock: Uint<64>
 ) {
     phase = disclose(0);
-    commitDeadline = disclose(startBlock + commitDuration);
-    revealDeadline = disclose(startBlock + commitDuration + revealDuration);
+    commitDeadline = disclose(commitDeadlineBlock);
+    revealDeadline = disclose(revealDeadlineBlock);
 }
 
 // ─── Phase transitions ────────────────────────────────────────────────────
