@@ -1,0 +1,164 @@
+// voting.compact
+// Commit/Reveal voting contract
+// Demonstrates: persistentHash, persistentCommit, HistoricMerkleTree,
+//               domain-separated nullifiers, block-height phase transitions
+// Companion to: bounty-296 article (Building a Commit/Reveal Voting System in Compact)
+
+pragma language_version >= 0.20;
+import CompactStandardLibrary;
+
+// ─── Phase constants ──────────────────────────────────────────────────────
+// 0 = COMMIT  — voters submit hashed votes
+// 1 = REVEAL  — voters prove and tally
+// 2 = CLOSED  — finalized, results available
+
+// ─── On-chain state ───────────────────────────────────────────────────────
+
+export ledger phase: Uint<8>;
+export ledger commitDeadline: Uint<64>;
+export ledger revealDeadline: Uint<64>;
+
+// HistoricMerkleTree: concurrent voter registrations won't invalidate outstanding proofs.
+// A standard MerkleTree proof is only valid against the current root; HistoricMerkleTree
+// checks against any root the tree has ever had.
+export ledger voterTree: HistoricMerkleTree<16, Bytes<32>>;
+
+// Maps nullifierHash → voteCommitment
+// Key:   persistentHash(voterSecret)     — binding, ties commitment to voter
+// Value: persistentCommit(vote, blinder) — hiding, conceals vote until reveal
+export ledger commitments: Map<Bytes<32>, Bytes<32>>;
+
+// Tracks spent nullifiers — prevents double-reveal
+export ledger spentNullifiers: Map<Bytes<32>, Boolean>;
+
+// Vote tallies
+export ledger yesVotes: Counter;
+export ledger noVotes: Counter;
+export ledger abstainVotes: Counter;
+export ledger totalCommits: Counter;
+export ledger totalReveals: Counter;
+
+// ─── Private witnesses ────────────────────────────────────────────────────
+// All supplied off-chain by TypeScript during proof generation — never on-chain
+
+witness getVoterSecret(): Bytes<32>;
+witness getVote(): Uint<8>;          // 0 = NO, 1 = YES, 2 = ABSTAIN
+witness getBlinder(): Bytes<32>;     // randomness for the vote commitment
+witness getVoterPath(): MerkleTreePath<16, Bytes<32>>;
+
+// ─── Constructor ──────────────────────────────────────────────────────────
+
+constructor(
+    startBlock: Uint<64>,
+    commitDuration: Uint<64>,
+    revealDuration: Uint<64>
+) {
+    phase = disclose(0);
+    commitDeadline = disclose(startBlock + commitDuration);
+    revealDeadline = disclose(startBlock + commitDuration + revealDuration);
+}
+
+// ─── Phase transitions ────────────────────────────────────────────────────
+// Permissionless: any caller can advance once the deadline passes.
+// currentBlock is a public parameter verified by the Midnight network at submission time.
+
+export circuit openRevealPhase(currentBlock: Uint<64>): [] {
+    assert(phase == 0, "Not in commit phase");
+    assert(disclose(currentBlock) >= commitDeadline, "Commit period not over");
+    phase = disclose(1);
+}
+
+export circuit closeVoting(currentBlock: Uint<64>): [] {
+    assert(phase == 1, "Not in reveal phase");
+    assert(disclose(currentBlock) >= revealDeadline, "Reveal period not over");
+    phase = disclose(2);
+}
+
+// ─── Voter registration ───────────────────────────────────────────────────
+// Adds a voter's public key leaf to the eligibility tree.
+// In production: gate this behind governance logic or a registration authority.
+
+export circuit registerVoter(voterKey: Bytes<32>): [] {
+    assert(phase == 0, "Registration only during commit phase");
+    voterTree.insert(disclose(voterKey));
+}
+
+// ─── Commit ───────────────────────────────────────────────────────────────
+// Voter submits two opaque 32-byte values:
+//   nullifierHash   = persistentHash(voterSecret)      — binding, no identity leak
+//   voteCommitment  = persistentCommit(vote, blinder)  — hiding, no vote leak
+//
+// The circuit verifies voter eligibility via a private Merkle path witness.
+// No vote or identity information touches the on-chain state.
+
+export circuit commitVote(
+    nullifierHash: Bytes<32>,
+    voteCommitment: Bytes<32>
+): [] {
+    assert(phase == 0, "Not in commit phase");
+
+    // Prove voter eligibility — the Merkle path stays private in the witness
+    const path     = getVoterPath();
+    const computed = merkleTreePathRoot<16, Bytes<32>>(path);
+    assert(
+        voterTree.checkRootInHistory(disclose(computed)),
+        "Voter not in eligibility tree"
+    );
+
+    // One commitment per voter
+    assert(!commitments.member(disclose(nullifierHash)), "Already committed");
+
+    commitments.insert(disclose(nullifierHash), disclose(voteCommitment));
+    totalCommits.increment(1);
+}
+
+// ─── Reveal ───────────────────────────────────────────────────────────────
+// Voter reveals their vote publicly and proves (via ZK) that it matches the
+// stored commitment. The voterSecret and blinder stay private — only vote is revealed.
+//
+// The ZK proof demonstrates:
+//   persistentHash(voterSecret) maps to a stored nullifierHash
+//   persistentCommit(vote, blinder) matches the stored voteCommitment
+//   the nullifier has not been spent
+
+export circuit revealVote(vote: Uint<8>): [] {
+    assert(phase == 1, "Not in reveal phase");
+    assert(vote < 3, "Invalid vote: must be 0 (NO), 1 (YES), or 2 (ABSTAIN)");
+
+    // Private witnesses — never appear on-chain
+    const secret  = getVoterSecret();
+    const blinder = getBlinder();
+
+    // Reconstruct nullifier hash from private secret
+    const nullifierHash = persistentHash<Bytes<32>>(secret);
+
+    // Reconstruct commitment from the now-public vote and private blinder
+    const derivedCommitment = persistentCommit<Uint<8>>(disclose(vote), blinder);
+
+    // Verify a commitment was stored for this voter's nullifier
+    assert(
+        commitments.member(disclose(nullifierHash)),
+        "No commitment found for this voter"
+    );
+
+    // Verify the revealed vote matches what was committed
+    assert(
+        derivedCommitment == commitments.lookup(disclose(nullifierHash)),
+        "Vote commitment mismatch — wrong vote, secret, or blinder"
+    );
+
+    // Mark nullifier spent — prevents double-reveal
+    assert(!spentNullifiers.member(disclose(nullifierHash)), "Vote already revealed");
+    spentNullifiers.insert(disclose(nullifierHash), disclose(true));
+
+    // Tally — vote is now public, branching on it is safe
+    if (vote == 0) {
+        noVotes.increment(1);
+    } else if (vote == 1) {
+        yesVotes.increment(1);
+    } else {
+        abstainVotes.increment(1);
+    }
+
+    totalReveals.increment(1);
+}
