@@ -103,7 +103,7 @@ export circuit commitVote(
     const path     = getVoterPath();
     const computed = merkleTreePathRoot<16, Bytes<32>>(path);
     assert(
-        voterTree.checkRootInHistory(disclose(computed)),
+        voterTree.checkRoot(disclose(computed)),
         "Voter not in eligibility tree"
     );
 
